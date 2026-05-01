@@ -3,3 +3,4 @@
 目前功能有普通加密和高级加密(防字符串解密)
 改版本兼容性不太成熟
 完全开源，可进行二次修改
+AndroidCSProjects下载：https://github.com/AndroidCSIDE/ACSIDE
