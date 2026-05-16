@@ -688,10 +688,6 @@ private fun getRealPathFromUri(uri: Uri): String? {
         di.addInstruction(BuilderInstruction21c(Opcode.NEW_INSTANCE, 4, ImmutableTypeReference("Ljava/lang/String;")))
         di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_DIRECT, 2, 4, 3, 0, 0, 0, ImmutableMethodReference("Ljava/lang/String;", "<init>", listOf("[B"), "V")))
         di.addInstruction(BuilderInstruction11x(Opcode.RETURN_OBJECT, 4))
-        val tryEnd = di.instructions.size
-        di.addInstruction(BuilderInstruction11x(Opcode.RETURN_OBJECT, 11))
-        val handlerIdx = tryEnd
-        di.addTryCatch(0, tryEnd, null, handlerIdx)
 
         return ImmutableClassDef(
             ct, AccessFlags.PUBLIC.value, "Ljava/lang/Object;",
