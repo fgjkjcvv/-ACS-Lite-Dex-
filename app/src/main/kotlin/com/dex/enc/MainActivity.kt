@@ -52,7 +52,9 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import java.security.SecureRandom
 
 class MainActivity : AppCompatActivity() {
 
@@ -62,6 +64,9 @@ class MainActivity : AppCompatActivity() {
 // private lateinit var rbAdvanced: RadioButton
 private lateinit var swNormal: Switch
 private lateinit var swAdvanced: Switch
+private lateinit var swSuper: Switch
+private val superEncryptKey = SecretKeySpec("MySuperKey1234567".toByteArray(), "AES")
+private val secureRandom = SecureRandom()
     private var selectedApkUri: Uri? = null
     private var selectedFileName: String? = null
     private val encryptKey = SecretKeySpec("MySecureKey12345".toByteArray(), "AES")
@@ -87,6 +92,7 @@ uri?.let {
 etPath = findViewById(R.id.et_path)
 swNormal = findViewById(R.id.sw_normal)
 swAdvanced = findViewById(R.id.sw_advanced)
+swSuper = findViewById(R.id.sw_super)
 // 原来的 rgMode、rbNormal、rbAdvanced 这三行删除或注释掉
 
         findViewById<ImageView>(R.id.iv_choose).setOnClickListener {
@@ -100,18 +106,25 @@ findViewById<ImageView>(R.id.iv_start).setOnClickListener {
     }
 val normalOn = swNormal.isChecked
 val advancedOn = swAdvanced.isChecked
+val superOn = swSuper.isChecked
 
-if (!normalOn && !advancedOn) {
+val activeCount = listOf(normalOn, advancedOn, superOn).count { it }
+
+if (activeCount == 0) {
     Toast.makeText(this, "请至少开启一个加密模式", Toast.LENGTH_SHORT).show()
     return@setOnClickListener
 }
 
-if (normalOn && advancedOn) {
-    Toast.makeText(this, "请取消普通加密或高级加密再进行加密", Toast.LENGTH_SHORT).show()
+if (activeCount > 1) {
+    Toast.makeText(this, "请只开启一个加密模式", Toast.LENGTH_SHORT).show()
     return@setOnClickListener
 }
 
-val mode = if (normalOn) "normal" else "advanced"
+val mode = when {
+    normalOn -> "normal"
+    advancedOn -> "advanced"
+    else -> "super"
+}
     Thread {
         try {
             //  使用原始文件名，保留扩展名
@@ -362,12 +375,27 @@ private fun getRealPathFromUri(uri: Uri): String? {
         tempIn.writeBytes(dexBytes)
         val opcodes = Opcodes.getDefault()
         val originalDex = DexFileFactory.loadDexFile(tempIn, opcodes)
-        val rewrittenDex = createDexRewriter(mode, stringIndexMap).getDexFileRewriter().rewrite(originalDex)
+
+        val effectiveStringIndexMap = if (mode == "super") {
+            collectStrings(dexBytes)
+        } else {
+            stringIndexMap
+        }
+
+        val rewrittenDex = createDexRewriter(mode, effectiveStringIndexMap).getDexFileRewriter().rewrite(originalDex)
         val allClasses = rewrittenDex.classes.mapTo(mutableSetOf<ClassDef>()) { it }
         if (injectDecryptor) {
-            allClasses.add(buildDecryptorClass())
-            if (mode == "advanced") {
-                allClasses.add(buildStringPoolClass(stringIndexMap))
+            if (mode == "super") {
+                allClasses.add(buildSuperDecryptorClass())
+                allClasses.add(buildSuperStringPoolClass(effectiveStringIndexMap))
+                allClasses.add(buildJunkClass("Lcom/secure/a/Helper;"))
+                allClasses.add(buildJunkClass("Lcom/secure/b/Processor;"))
+                allClasses.add(buildJunkClass("Lcom/secure/c/Handler;"))
+            } else {
+                allClasses.add(buildDecryptorClass())
+                if (mode == "advanced") {
+                    allClasses.add(buildStringPoolClass(stringIndexMap))
+                }
             }
         }
         val tempOut = File(cacheDir, "temp_out.dex")
@@ -483,7 +511,7 @@ private fun getRealPathFromUri(uri: Uri): String? {
             override fun getClassDefRewriter(rewriters: Rewriters): Rewriter<ClassDef> {
                 val r = super.getClassDefRewriter(rewriters)
                 return Rewriter { classDef ->
-                    if (classDef.type == "Lcom/secure/Decryptor;" || classDef.type == "Lcom/secure/StringPool;") {
+                    if (classDef.type == "Lcom/secure/Decryptor;" || classDef.type == "Lcom/secure/StringPool;" || classDef.type == "Lcom/secure/SuperDecryptor;" || classDef.type == "Lcom/secure/SuperStringPool;" || classDef.type.startsWith("Lcom/secure/a/") || classDef.type.startsWith("Lcom/secure/b/") || classDef.type.startsWith("Lcom/secure/c/")) {
                         classDef
                     } else {
                         r.rewrite(classDef)
@@ -504,7 +532,7 @@ private fun getRealPathFromUri(uri: Uri): String? {
                                     val next = ins[i + 1]
                                     if (next is ReferenceInstruction && next.reference is ImmutableMethodReference) {
                                         val ref = next.reference as ImmutableMethodReference
-                                        if (ref.definingClass == "Lcom/secure/Decryptor;" && ref.name == "decrypt") {
+                                        if ((ref.definingClass == "Lcom/secure/Decryptor;" || ref.definingClass == "Lcom/secure/SuperDecryptor;") && ref.name == "decrypt") {
                                             i++
                                             continue
                                         }
@@ -513,7 +541,7 @@ private fun getRealPathFromUri(uri: Uri): String? {
                                 val str = (inst.reference as StringReference).string
                                 val reg = if (inst is OneRegisterInstruction) inst.registerA else -1
                                 if (reg >= 0) {
-                                    if (mode == "advanced" && stringIndexMap.containsKey(str)) {
+                                    if ((mode == "advanced" || mode == "super") && stringIndexMap.containsKey(str)) {
                                         val idx = stringIndexMap[str]!!
                                         if (idx in -8..7) {
                                             m.replaceInstruction(i, BuilderInstruction11n(Opcode.CONST_4, reg, idx))
@@ -522,7 +550,11 @@ private fun getRealPathFromUri(uri: Uri): String? {
                                         } else {
                                             m.replaceInstruction(i, BuilderInstruction31i(Opcode.CONST, reg, idx))
                                         }
-                                        val poolRef = ImmutableMethodReference("Lcom/secure/StringPool;", "get", listOf("I"), "Ljava/lang/String;")
+                                        val poolRef = if (mode == "super") {
+                                            ImmutableMethodReference("Lcom/secure/SuperStringPool;", "get", listOf("I"), "Ljava/lang/String;")
+                                        } else {
+                                            ImmutableMethodReference("Lcom/secure/StringPool;", "get", listOf("I"), "Ljava/lang/String;")
+                                        }
                                         if (reg < 16) {
                                             m.addInstruction(i + 1, BuilderInstruction35c(Opcode.INVOKE_STATIC, 1, reg, 0, 0, 0, 0, poolRef))
                                         } else {
@@ -531,15 +563,23 @@ private fun getRealPathFromUri(uri: Uri): String? {
                                         m.addInstruction(i + 2, BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, reg))
                                         i += 2
                                     } else {
-                                        val enc = try {
-                                            val c = Cipher.getInstance("AES/ECB/PKCS5Padding")
-                                            c.init(Cipher.ENCRYPT_MODE, encryptKey)
-                                            Base64.encodeToString(c.doFinal(str.toByteArray()), Base64.NO_WRAP)
-                                        } catch (e: Exception) {
-                                            str
+                                        val enc = if (mode == "super") {
+                                            superEncryptString(str)
+                                        } else {
+                                            try {
+                                                val c = Cipher.getInstance("AES/ECB/PKCS5Padding")
+                                                c.init(Cipher.ENCRYPT_MODE, encryptKey)
+                                                Base64.encodeToString(c.doFinal(str.toByteArray()), Base64.NO_WRAP)
+                                            } catch (e: Exception) {
+                                                str
+                                            }
                                         }
                                         m.replaceInstruction(i, BuilderInstruction21c(Opcode.CONST_STRING, reg, ImmutableStringReference(enc)))
-                                        val decRef = ImmutableMethodReference("Lcom/secure/Decryptor;", "decrypt", listOf("Ljava/lang/String;"), "Ljava/lang/String;")
+                                        val decRef = if (mode == "super") {
+                                            ImmutableMethodReference("Lcom/secure/SuperDecryptor;", "decrypt", listOf("Ljava/lang/String;"), "Ljava/lang/String;")
+                                        } else {
+                                            ImmutableMethodReference("Lcom/secure/Decryptor;", "decrypt", listOf("Ljava/lang/String;"), "Ljava/lang/String;")
+                                        }
                                         if (reg < 16) {
                                             m.addInstruction(i + 1, BuilderInstruction35c(Opcode.INVOKE_STATIC, 1, reg, 0, 0, 0, 0, decRef))
                                         } else {
@@ -559,6 +599,235 @@ private fun getRealPathFromUri(uri: Uri): String? {
                 }
             }
         })
+    }
+
+    private fun collectStrings(dexBytes: ByteArray): Map<String, Int> {
+        val tempFile = File(cacheDir, "temp_scan.dex")
+        tempFile.writeBytes(dexBytes)
+        val dex = DexFileFactory.loadDexFile(tempFile, Opcodes.getDefault())
+        val stringSet = mutableSetOf<String>()
+        for (classDef in dex.classes) {
+            if (classDef.type.startsWith("Lcom/secure/")) continue
+            for (method in classDef.methods) {
+                val impl = method.implementation ?: continue
+                for (inst in impl.instructions) {
+                    if (inst is ReferenceInstruction && inst.reference is StringReference) {
+                        val str = (inst.reference as StringReference).string
+                        if (str.isNotEmpty()) {
+                            stringSet.add(str)
+                        }
+                    }
+                }
+            }
+        }
+        tempFile.delete()
+        val shuffled = stringSet.toList().shuffled(secureRandom)
+        return shuffled.mapIndexed { index, s -> s to index }.toMap()
+    }
+
+    private fun superEncryptString(str: String): String {
+        val iv = ByteArray(16)
+        secureRandom.nextBytes(iv)
+        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        cipher.init(Cipher.ENCRYPT_MODE, superEncryptKey, IvParameterSpec(iv))
+        val encrypted = cipher.doFinal(str.toByteArray())
+        val combined = ByteArray(iv.size + encrypted.size)
+        System.arraycopy(iv, 0, combined, 0, iv.size)
+        System.arraycopy(encrypted, 0, combined, iv.size, encrypted.size)
+        return Base64.encodeToString(combined, Base64.NO_WRAP)
+    }
+
+    private fun buildSuperDecryptorClass(): ClassDef {
+        val ct = "Lcom/secure/SuperDecryptor;"
+        val kf = ImmutableField(ct, "key", "[B", AccessFlags.PRIVATE.value or AccessFlags.STATIC.value, null, ImmutableSet.of(), ImmutableSet.of())
+
+        val ci = MutableMethodImplementation(4)
+        ci.addInstruction(BuilderInstruction35c(Opcode.INVOKE_STATIC, 0, 0, 0, 0, 0, 0, ImmutableMethodReference("Landroid/os/Debug;", "isDebuggerConnected", emptyList(), "Z")))
+        ci.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT, 0))
+        ci.addInstruction(BuilderInstruction21c(Opcode.CONST_STRING, 1, ImmutableStringReference("MySuperKey1234567")))
+        ci.addInstruction(BuilderInstruction35c(Opcode.INVOKE_VIRTUAL, 1, 1, 0, 0, 0, 0, ImmutableMethodReference("Ljava/lang/String;", "getBytes", emptyList(), "[B")))
+        ci.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, 1))
+        ci.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 2, 1))
+        ci.addInstruction(BuilderInstruction23x(Opcode.SUB_INT, 0, 2, 0))
+        ci.addInstruction(BuilderInstruction12x(Opcode.ARRAY_LENGTH, 2, 1))
+        ci.addInstruction(BuilderInstruction23x(Opcode.MUL_INT, 2, 2, 0))
+        ci.addInstruction(BuilderInstruction22c(Opcode.NEW_ARRAY, 0, 2, ImmutableTypeReference("[B")))
+        ci.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 3, 0))
+        ci.addInstruction(BuilderInstruction35c(Opcode.INVOKE_STATIC, 5, 1, 3, 0, 3, 2, ImmutableMethodReference("Ljava/lang/System;", "arraycopy", listOf("Ljava/lang/Object;", "I", "Ljava/lang/Object;", "I", "I"), "V")))
+        ci.addInstruction(BuilderInstruction21c(Opcode.SPUT_OBJECT, 0, kf))
+        ci.addInstruction(BuilderInstruction10x(Opcode.RETURN_VOID))
+
+        val di = MutableMethodImplementation(12)
+        di.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 0, 0))
+        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_STATIC, 2, 11, 0, 0, 0, 0, ImmutableMethodReference("Landroid/util/Base64;", "decode", listOf("Ljava/lang/String;", "I"), "[B")))
+        di.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, 0))
+        di.addInstruction(BuilderInstruction21s(Opcode.CONST_16, 1, 16))
+        di.addInstruction(BuilderInstruction22c(Opcode.NEW_ARRAY, 2, 1, ImmutableTypeReference("[B")))
+        di.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 3, 0))
+        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_STATIC, 5, 0, 3, 2, 3, 1, ImmutableMethodReference("Ljava/lang/System;", "arraycopy", listOf("Ljava/lang/Object;", "I", "Ljava/lang/Object;", "I", "I"), "V")))
+        di.addInstruction(BuilderInstruction12x(Opcode.ARRAY_LENGTH, 1, 0))
+        di.addInstruction(BuilderInstruction21s(Opcode.CONST_16, 3, 16))
+        di.addInstruction(BuilderInstruction23x(Opcode.SUB_INT, 1, 1, 3))
+        di.addInstruction(BuilderInstruction22c(Opcode.NEW_ARRAY, 3, 1, ImmutableTypeReference("[B")))
+        di.addInstruction(BuilderInstruction21s(Opcode.CONST_16, 4, 16))
+        di.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 5, 0))
+        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_STATIC, 5, 0, 4, 3, 5, 1, ImmutableMethodReference("Ljava/lang/System;", "arraycopy", listOf("Ljava/lang/Object;", "I", "Ljava/lang/Object;", "I", "I"), "V")))
+        di.addInstruction(BuilderInstruction21c(Opcode.NEW_INSTANCE, 4, ImmutableTypeReference("Ljavax/crypto/spec/SecretKeySpec;")))
+        di.addInstruction(BuilderInstruction21c(Opcode.SGET_OBJECT, 5, kf))
+        di.addInstruction(BuilderInstruction21c(Opcode.CONST_STRING, 6, ImmutableStringReference("AES")))
+        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_DIRECT, 3, 4, 5, 6, 0, 0, ImmutableMethodReference("Ljavax/crypto/spec/SecretKeySpec;", "<init>", listOf("[B", "Ljava/lang/String;"), "V")))
+        di.addInstruction(BuilderInstruction21c(Opcode.NEW_INSTANCE, 5, ImmutableTypeReference("Ljavax/crypto/spec/IvParameterSpec;")))
+        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_DIRECT, 2, 5, 2, 0, 0, 0, ImmutableMethodReference("Ljavax/crypto/spec/IvParameterSpec;", "<init>", listOf("[B"), "V")))
+        di.addInstruction(BuilderInstruction21c(Opcode.CONST_STRING, 6, ImmutableStringReference("AES/CBC/PKCS5Padding")))
+        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_STATIC, 1, 6, 0, 0, 0, 0, ImmutableMethodReference("Ljavax/crypto/Cipher;", "getInstance", listOf("Ljava/lang/String;"), "Ljavax/crypto/Cipher;")))
+        di.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, 6))
+        di.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 7, 2))
+        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_VIRTUAL, 4, 6, 7, 4, 5, 0, ImmutableMethodReference("Ljavax/crypto/Cipher;", "init", listOf("I", "Ljava/security/Key;", "Ljava/security/spec/AlgorithmParameterSpec;"), "V")))
+        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_VIRTUAL, 2, 6, 3, 0, 0, 0, ImmutableMethodReference("Ljavax/crypto/Cipher;", "doFinal", listOf("[B"), "[B")))
+        di.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, 3))
+        di.addInstruction(BuilderInstruction21c(Opcode.NEW_INSTANCE, 4, ImmutableTypeReference("Ljava/lang/String;")))
+        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_DIRECT, 2, 4, 3, 0, 0, 0, ImmutableMethodReference("Ljava/lang/String;", "<init>", listOf("[B"), "V")))
+        di.addInstruction(BuilderInstruction11x(Opcode.RETURN_OBJECT, 4))
+        val tryEnd = di.instructions.size
+        di.addInstruction(BuilderInstruction11x(Opcode.RETURN_OBJECT, 11))
+        val handlerIdx = tryEnd
+        di.addTryCatch(0, tryEnd, null, handlerIdx)
+
+        return ImmutableClassDef(
+            ct, AccessFlags.PUBLIC.value, "Ljava/lang/Object;",
+            emptyList(), null, ImmutableSet.of(), listOf(kf), emptyList(),
+            listOf(
+                ImmutableMethod(ct, "<clinit>", emptyList(), "V", AccessFlags.STATIC.value or AccessFlags.CONSTRUCTOR.value, ImmutableSet.of(), ImmutableSet.of(), ci),
+                ImmutableMethod(ct, "decrypt", listOf(ImmutableMethodParameter("Ljava/lang/String;", ImmutableSet.of(), null)), "Ljava/lang/String;", AccessFlags.PUBLIC.value or AccessFlags.STATIC.value, ImmutableSet.of(), ImmutableSet.of(), di)
+            ), emptyList()
+        )
+    }
+
+    private fun buildSuperStringPoolClass(stringIndexMap: Map<String, Int>): ClassDef {
+        val classType = "Lcom/secure/SuperStringPool;"
+        val maxIndex = stringIndexMap.values.maxOrNull() ?: -1
+        val encStrings = Array(maxIndex + 1) { "" }
+        for ((str, idx) in stringIndexMap) {
+            encStrings[idx] = try {
+                superEncryptString(str)
+            } catch (e: Exception) {
+                str
+            }
+        }
+        val arrayField = ImmutableField(
+            classType, "S", "[Ljava/lang/String;",
+            AccessFlags.PRIVATE.value or AccessFlags.STATIC.value or AccessFlags.FINAL.value,
+            null, ImmutableSet.of(), ImmutableSet.of()
+        )
+        val clinit = MutableMethodImplementation(3)
+        val size = encStrings.size
+        if (size <= 7) {
+            clinit.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 0, size))
+        } else {
+            clinit.addInstruction(BuilderInstruction21s(Opcode.CONST_16, 0, size))
+        }
+        clinit.addInstruction(
+            BuilderInstruction22c(Opcode.NEW_ARRAY, 1, 0, ImmutableTypeReference("[Ljava/lang/String;"))
+        )
+        encStrings.forEachIndexed { i, s ->
+            clinit.addInstruction(BuilderInstruction21c(Opcode.CONST_STRING, 0, ImmutableStringReference(s)))
+            if (i <= 7) {
+                clinit.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 2, i))
+            } else {
+                clinit.addInstruction(BuilderInstruction21s(Opcode.CONST_16, 2, i))
+            }
+            clinit.addInstruction(BuilderInstruction23x(Opcode.APUT_OBJECT, 0, 1, 2))
+        }
+        clinit.addInstruction(BuilderInstruction21c(Opcode.SPUT_OBJECT, 1, arrayField))
+        clinit.addInstruction(BuilderInstruction10x(Opcode.RETURN_VOID))
+
+        val get = MutableMethodImplementation(3)
+        get.addInstruction(BuilderInstruction21c(Opcode.SGET_OBJECT, 0, arrayField))
+        get.addInstruction(BuilderInstruction23x(Opcode.AGET_OBJECT, 1, 0, 2))
+        get.addInstruction(
+            BuilderInstruction35c(
+                Opcode.INVOKE_STATIC, 1, 1, 0, 0, 0, 0,
+                ImmutableMethodReference("Lcom/secure/SuperDecryptor;", "decrypt", listOf("Ljava/lang/String;"), "Ljava/lang/String;")
+            )
+        )
+        get.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, 0))
+        get.addInstruction(BuilderInstruction11x(Opcode.RETURN_OBJECT, 0))
+
+        return ImmutableClassDef(
+            classType, AccessFlags.PUBLIC.value, "Ljava/lang/Object;",
+            emptyList(), null, ImmutableSet.of(), listOf(arrayField), emptyList(),
+            listOf(
+                ImmutableMethod(classType, "<clinit>", emptyList(), "V", AccessFlags.STATIC.value or AccessFlags.CONSTRUCTOR.value, ImmutableSet.of(), ImmutableSet.of(), clinit),
+                ImmutableMethod(classType, "get", listOf(ImmutableMethodParameter("I", ImmutableSet.of(), null)), "Ljava/lang/String;", AccessFlags.PUBLIC.value or AccessFlags.STATIC.value, ImmutableSet.of(), ImmutableSet.of(), get)
+            ), emptyList()
+        )
+    }
+
+    private fun buildJunkClass(classType: String): ClassDef {
+        val tagField = ImmutableField(
+            classType, "tag", "I",
+            AccessFlags.PRIVATE.value or AccessFlags.STATIC.value,
+            null, ImmutableSet.of(), ImmutableSet.of()
+        )
+        val dataField = ImmutableField(
+            classType, "data", "[B",
+            AccessFlags.PRIVATE.value or AccessFlags.STATIC.value,
+            null, ImmutableSet.of(), ImmutableSet.of()
+        )
+
+        val clinit = MutableMethodImplementation(3)
+        clinit.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 0, 7))
+        clinit.addInstruction(BuilderInstruction21c(Opcode.SPUT, 0, tagField))
+        clinit.addInstruction(BuilderInstruction21s(Opcode.CONST_16, 0, 64))
+        clinit.addInstruction(BuilderInstruction22c(Opcode.NEW_ARRAY, 1, 0, ImmutableTypeReference("[B")))
+        clinit.addInstruction(BuilderInstruction21c(Opcode.SPUT_OBJECT, 1, dataField))
+        clinit.addInstruction(BuilderInstruction10x(Opcode.RETURN_VOID))
+
+        val compute = MutableMethodImplementation(4)
+        compute.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 1, 3))
+        compute.addInstruction(BuilderInstruction23x(Opcode.MUL_INT, 0, 3, 1))
+        compute.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 1, 17))
+        compute.addInstruction(BuilderInstruction23x(Opcode.ADD_INT, 0, 0, 1))
+        compute.addInstruction(BuilderInstruction21c(Opcode.SGET, 2, tagField))
+        compute.addInstruction(BuilderInstruction23x(Opcode.ADD_INT, 0, 0, 2))
+        compute.addInstruction(BuilderInstruction11x(Opcode.RETURN, 0))
+
+        val process = MutableMethodImplementation(4)
+        process.addInstruction(BuilderInstruction35c(Opcode.INVOKE_VIRTUAL, 1, 3, 0, 0, 0, 0,
+            ImmutableMethodReference("Ljava/lang/String;", "length", emptyList(), "I")))
+        process.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT, 0))
+        process.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 1, 1))
+        process.addInstruction(BuilderInstruction23x(Opcode.ADD_INT, 0, 0, 1))
+        process.addInstruction(BuilderInstruction35c(Opcode.INVOKE_VIRTUAL, 2, 3, 0, 0, 0, 0,
+            ImmutableMethodReference("Ljava/lang/String;", "substring", listOf("I", "I"), "Ljava/lang/String;")))
+        process.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, 0))
+        process.addInstruction(BuilderInstruction11x(Opcode.RETURN_OBJECT, 0))
+
+        val transform = MutableMethodImplementation(3)
+        transform.addInstruction(BuilderInstruction21c(Opcode.SGET_OBJECT, 0, dataField))
+        transform.addInstruction(BuilderInstruction12x(Opcode.ARRAY_LENGTH, 1, 0))
+        transform.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 2, 1))
+        transform.addInstruction(BuilderInstruction23x(Opcode.SUB_INT, 1, 1, 2))
+        transform.addInstruction(BuilderInstruction11x(Opcode.RETURN, 1))
+
+        return ImmutableClassDef(
+            classType, AccessFlags.PUBLIC.value, "Ljava/lang/Object;",
+            emptyList(), null, ImmutableSet.of(), listOf(tagField, dataField), emptyList(),
+            listOf(
+                ImmutableMethod(classType, "<clinit>", emptyList(), "V",
+                    AccessFlags.STATIC.value or AccessFlags.CONSTRUCTOR.value,
+                    ImmutableSet.of(), ImmutableSet.of(), clinit),
+                ImmutableMethod(classType, "compute", listOf(ImmutableMethodParameter("I", ImmutableSet.of(), null)), "I",
+                    AccessFlags.PUBLIC.value or AccessFlags.STATIC.value,
+                    ImmutableSet.of(), ImmutableSet.of(), compute),
+                ImmutableMethod(classType, "process", listOf(ImmutableMethodParameter("Ljava/lang/String;", ImmutableSet.of(), null)), "Ljava/lang/String;",
+                    AccessFlags.PUBLIC.value or AccessFlags.STATIC.value,
+                    ImmutableSet.of(), ImmutableSet.of(), process),
+                ImmutableMethod(classType, "transform", emptyList(), "I",
+                    AccessFlags.PUBLIC.value or AccessFlags.STATIC.value,
+                    ImmutableSet.of(), ImmutableSet.of(), transform)
+            ), emptyList()
+        )
     }
 
     private fun repackApk(originalApk: File, modifiedDexMap: Map<String, ByteArray>, outputApk: File) {
